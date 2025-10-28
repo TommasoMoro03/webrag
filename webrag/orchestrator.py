@@ -16,12 +16,13 @@ import logging
 
 from webrag.sources.sources_loader import SourceLoader
 from webrag.schemas.source_profile import SourceProfile
-from webrag.schemas.document import DocumentChunk, ExtractionResult
+from webrag.schemas.document import DocumentChunk, ExtractionResult, DocumentGroup
 from webrag.schemas.response import PipelineResult
 from webrag.fetcher import BaseFetcher
 from webrag.extractors import BaseExtractor
 from webrag.chunking import BaseChunker
 from webrag.output import BaseExporter
+from webrag.crawler import BaseCrawler
 from webrag.utils.exceptions import (
     PipelineError,
     ConfigurationError,
@@ -55,6 +56,8 @@ class WebRAG:
         extractor: Optional[BaseExtractor] = None,
         chunker: Optional[BaseChunker] = None,
         exporter: Optional[BaseExporter] = None,
+        crawler: Optional[BaseCrawler] = None,
+        enable_crawling: bool = True,
         fail_fast: bool = False,
         verbose: bool = False,
     ):
@@ -70,6 +73,8 @@ class WebRAG:
             extractor: Custom extractor instance (if None, uses default)
             chunker: Custom chunker instance (if None, uses default)
             exporter: Custom exporter instance (if None, uses default)
+            crawler: Custom crawler instance (if None, uses default when enable_crawling=True)
+            enable_crawling: Enable link discovery and multi-page crawling (default: True)
             fail_fast: If True, stop on first error; if False, collect errors and continue
             verbose: Enable verbose logging
 
@@ -94,17 +99,20 @@ class WebRAG:
         # Store configuration
         self.fail_fast = fail_fast
         self.verbose = verbose
+        self.enable_crawling = enable_crawling
 
         # Initialize pipeline components
         self.fetcher = fetcher or self._get_default_fetcher()
         self.extractor = extractor or self._get_default_extractor()
         self.chunker = chunker or self._get_default_chunker()
         self.exporter = exporter or self._get_default_exporter()
+        self.crawler = crawler or (self._get_default_crawler() if enable_crawling else None)
 
         # Pipeline state
         self.result: Optional[PipelineResult] = None
         self.chunks: List[DocumentChunk] = []
         self._extraction_results: List[ExtractionResult] = []
+        self._document_groups: List[DocumentGroup] = []
         self._errors: List[str] = []
         self._warnings: List[str] = []
         self._started_at: Optional[datetime] = None
@@ -171,11 +179,31 @@ class WebRAG:
                 "implement webrag.output.json_exporter.JSONExporter"
             )
 
+    def _get_default_crawler(self) -> BaseCrawler:
+        """Get default crawler implementation."""
+        try:
+            from webrag.crawler.simple_crawler import SimpleCrawler
+            return SimpleCrawler()
+        except ImportError:
+            logger.warning(
+                "No concrete crawler implementation found. "
+                "Please implement SimpleCrawler or provide a custom crawler."
+            )
+            raise ConfigurationError(
+                "No crawler available. Please provide a crawler instance or "
+                "implement webrag.crawler.simple_crawler.SimpleCrawler"
+            )
+
     def build(self) -> "WebRAG":
         """
-        Execute the main pipeline: fetch → extract → chunk.
+        Execute the main pipeline with optional crawling.
 
-        This method processes all sources and creates RAG-ready document chunks.
+        Pipeline flow:
+        1. Fetch source pages
+        2. [If crawling enabled] Discover links and fetch discovered pages
+        3. [If crawling enabled] Group related pages
+        4. Extract content from all pages
+        5. Chunk content with group associations
 
         Returns:
             self (for method chaining)
@@ -189,6 +217,7 @@ class WebRAG:
         # Reset state
         self.chunks = []
         self._extraction_results = []
+        self._document_groups = []
         self._errors = []
         self._warnings = []
 
@@ -198,18 +227,16 @@ class WebRAG:
             logger.info(f"Processing source {i+1}/{len(self.sources)}: {source.url}")
 
             try:
-                # Step 1: Fetch
-                fetch_result = self._fetch_source(source)
+                if self.enable_crawling and self.crawler and source.crawl_settings.max_depth > 0:
+                    # CRAWLING MODE: Multi-page processing
+                    chunks = self._process_source_with_crawling(source)
+                else:
+                    # SIMPLE MODE: Single page processing
+                    chunks = self._process_source_simple(source)
 
-                # Step 2: Extract
-                extraction_result = self._extract_content(fetch_result, source)
-                self._extraction_results.append(extraction_result)
-
-                # Step 3: Chunk
-                chunks = self._chunk_content(extraction_result)
                 self.chunks.extend(chunks)
-
                 sources_processed += 1
+
                 logger.info(
                     f"Successfully processed {source.url}: "
                     f"created {len(chunks)} chunk(s)"
@@ -239,6 +266,8 @@ class WebRAG:
             metadata={
                 "total_sources": len(self.sources),
                 "success_rate": sources_processed / len(self.sources) if self.sources else 0,
+                "crawling_enabled": self.enable_crawling,
+                "document_groups_created": len(self._document_groups),
             }
         )
 
@@ -318,6 +347,187 @@ class WebRAG:
             raise ChunkingError(
                 f"Failed to chunk content from {extraction_result.url}: {str(e)}"
             ) from e
+
+    def _process_source_simple(self, source: SourceProfile) -> List[DocumentChunk]:
+        """
+        Process a single source without crawling (simple mode).
+
+        Args:
+            source: SourceProfile to process
+
+        Returns:
+            List of DocumentChunk objects
+        """
+        # Step 1: Fetch
+        fetch_result = self._fetch_source(source)
+
+        # Step 2: Extract
+        extraction_result = self._extract_content(fetch_result, source)
+        self._extraction_results.append(extraction_result)
+
+        # Step 3: Chunk
+        chunks = self._chunk_content(extraction_result)
+
+        return chunks
+
+    def _process_source_with_crawling(self, source: SourceProfile) -> List[DocumentChunk]:
+        """
+        Process a source with link discovery and multi-page crawling.
+
+        Pipeline:
+        1. Fetch source page
+        2. Discover links using crawler
+        3. Fetch discovered pages
+        4. Group related pages
+        5. Extract content from all pages
+        6. Chunk with group associations
+
+        Args:
+            source: SourceProfile to process
+
+        Returns:
+            List of DocumentChunk objects
+        """
+        all_chunks = []
+
+        # Step 1: Fetch source page
+        logger.info(f"  [1/6] Fetching source page: {source.url}")
+        source_fetch_result = self._fetch_source(source)
+        self.crawler.mark_visited(str(source.url))
+
+        # Step 2: Discover links
+        logger.info(f"  [2/6] Discovering links from source page...")
+        discovered_links = self.crawler.discover_links(
+            source_fetch_result['content'],
+            str(source.url),
+            source
+        )
+        logger.info(f"  Found {len(discovered_links)} link(s) to crawl")
+
+        # Step 3: Fetch discovered pages
+        logger.info(f"  [3/6] Fetching discovered pages...")
+        discovered_fetch_results = {}
+        for link in discovered_links[:source.crawl_settings.max_pages or len(discovered_links)]:
+            try:
+                # Create temporary source profile for discovered page
+                temp_source = SourceProfile(
+                    url=link,
+                    type=source.type,
+                    crawl_settings=source.crawl_settings,
+                    enabled=source.enabled
+                )
+                fetch_result = self._fetch_source(temp_source)
+                discovered_fetch_results[link] = fetch_result
+                self.crawler.mark_visited(link)
+            except Exception as e:
+                logger.warning(f"  Failed to fetch {link}: {e}")
+                continue
+
+        # Step 4: Group related pages
+        logger.info(f"  [4/6] Grouping related pages...")
+        all_urls = [str(source.url)] + list(discovered_fetch_results.keys())
+        document_groups = self.crawler.group_related_pages(all_urls)
+        self._document_groups.extend(document_groups)
+        logger.info(f"  Created {len(document_groups)} document group(s)")
+
+        # Step 5: Extract content from all pages
+        logger.info(f"  [5/6] Extracting content from all pages...")
+        extractions_by_url = {}
+
+        # Extract source page
+        try:
+            source_extraction = self._extract_content(source_fetch_result, source)
+            extractions_by_url[str(source.url)] = source_extraction
+            self._extraction_results.append(source_extraction)
+        except Exception as e:
+            logger.warning(f"  Failed to extract from {source.url}: {e}")
+
+        # Extract discovered pages
+        for url, fetch_result in discovered_fetch_results.items():
+            try:
+                temp_source = SourceProfile(url=url, type=source.type, enabled=source.enabled)
+                extraction = self._extract_content(fetch_result, temp_source)
+                extractions_by_url[url] = extraction
+                self._extraction_results.append(extraction)
+            except Exception as e:
+                logger.warning(f"  Failed to extract from {url}: {e}")
+                continue
+
+        # Step 6: Chunk with group associations
+        logger.info(f"  [6/6] Chunking content with group associations...")
+
+        if document_groups:
+            # Process grouped pages
+            for group in document_groups:
+                group_chunks = self._chunk_document_group(group, extractions_by_url)
+                all_chunks.extend(group_chunks)
+
+            # Process ungrouped pages (those not in any group)
+            grouped_urls = set()
+            for group in document_groups:
+                grouped_urls.update(str(url) for url in group.page_urls)
+
+            for url, extraction in extractions_by_url.items():
+                if url not in grouped_urls:
+                    try:
+                        chunks = self._chunk_content(extraction)
+                        all_chunks.extend(chunks)
+                    except Exception as e:
+                        logger.warning(f"  Failed to chunk {url}: {e}")
+        else:
+            # No groups created, process all individually
+            for extraction in extractions_by_url.values():
+                try:
+                    chunks = self._chunk_content(extraction)
+                    all_chunks.extend(chunks)
+                except Exception as e:
+                    logger.warning(f"  Failed to chunk content: {e}")
+
+        return all_chunks
+
+    def _chunk_document_group(
+        self,
+        group: DocumentGroup,
+        extractions_by_url: Dict[str, ExtractionResult]
+    ) -> List[DocumentChunk]:
+        """
+        Chunk a document group, maintaining group associations.
+
+        Args:
+            group: DocumentGroup to chunk
+            extractions_by_url: Map of URL to ExtractionResult
+
+        Returns:
+            List of DocumentChunk objects with group information
+        """
+        group_chunks = []
+
+        for page_index, page_url in enumerate(group.page_urls):
+            url_str = str(page_url)
+
+            if url_str not in extractions_by_url:
+                continue
+
+            extraction = extractions_by_url[url_str]
+
+            try:
+                # Chunk this page
+                page_chunks = self._chunk_content(extraction)
+
+                # Add group information to each chunk
+                for chunk in page_chunks:
+                    chunk.document_group_id = group.group_id
+                    chunk.page_url = page_url
+                    chunk.page_index = page_index
+                    chunk.total_pages = len(group.page_urls)
+
+                group_chunks.extend(page_chunks)
+
+            except Exception as e:
+                logger.warning(f"  Failed to chunk page {url_str} in group {group.group_id}: {e}")
+                continue
+
+        return group_chunks
 
     def export(self, format: str = "json", **kwargs) -> List[Dict[str, Any]]:
         """

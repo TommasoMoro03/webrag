@@ -1,0 +1,571 @@
+"""AI-powered crawler using LLM prompts for intelligent link discovery and content navigation."""
+
+from typing import List, Dict, Any, Optional, Callable
+from urllib.parse import urlparse
+from lxml import html as lxml_html
+import hashlib
+import json
+import re
+
+from webrag.crawler.base import BaseCrawler
+from webrag.schemas.source_profile import SourceProfile
+from webrag.schemas.document import DocumentGroup
+
+
+class AICrawler(BaseCrawler):
+    """
+    AI-powered crawler that uses LLM prompts instead of heuristics.
+
+    This implementation:
+    - Uses AI to analyze HTML and determine which links are relevant
+    - Intelligently decides which links to follow based on content understanding
+    - Groups related pages using semantic similarity and content analysis
+    - Adapts to different website structures without hardcoded rules
+
+    The crawler requires an LLM function to be provided during initialization.
+    """
+
+    def __init__(
+        self,
+        llm_function: Callable[[str], str],
+        **kwargs
+    ):
+        """
+        Initialize the AI crawler.
+
+        Args:
+            llm_function: A callable that takes a prompt (str) and returns an LLM response (str)
+                         Should be a simple function like: lambda prompt: client.chat(prompt)
+            **kwargs: Configuration options
+                - max_links_per_page: Maximum links to analyze per page (default: 50)
+                - min_confidence: Minimum confidence score for following links (default: 0.6)
+                - enable_smart_grouping: Use AI for page grouping (default: True)
+                - temperature: LLM temperature for creativity (default: 0.3)
+                - extraction_selector: CSS selector for content area (default: 'body')
+        """
+        super().__init__(**kwargs)
+        self.llm_function = llm_function
+        self.max_links_per_page = kwargs.get('max_links_per_page', 50)
+        self.min_confidence = kwargs.get('min_confidence', 0.6)
+        self.enable_smart_grouping = kwargs.get('enable_smart_grouping', True)
+        self.temperature = kwargs.get('temperature', 0.3)
+        self.extraction_selector = kwargs.get('extraction_selector', 'body')
+
+        # Cache for AI responses to avoid redundant calls
+        self._response_cache: Dict[str, Any] = {}
+
+    def discover_links(
+        self,
+        raw_content: str,
+        source_url: str,
+        source: SourceProfile
+    ) -> List[str]:
+        """
+        Discover links using AI analysis of HTML content.
+
+        Args:
+            raw_content: Raw HTML content
+            source_url: URL of the page being analyzed
+            source: SourceProfile with crawl settings
+
+        Returns:
+            List of discovered URLs (absolute URLs)
+        """
+        if not raw_content:
+            return []
+
+        try:
+            # Parse HTML
+            tree = lxml_html.fromstring(raw_content)
+
+            # Extract all links with context
+            link_contexts = self._extract_links_with_context(tree, source_url)
+
+            if not link_contexts:
+                return []
+
+            # Limit to avoid overwhelming the LLM
+            link_contexts = link_contexts[:self.max_links_per_page]
+
+            # Use AI to analyze and filter links
+            relevant_links = self._ai_filter_links(
+                link_contexts,
+                source_url,
+                source
+            )
+
+            # Apply basic filters from crawl settings
+            filtered_links = self.filter_links(relevant_links, source)
+
+            return filtered_links
+
+        except Exception as e:
+            # Fallback to empty list if extraction fails
+            return []
+
+    def should_follow_link(
+        self,
+        link_url: str,
+        source_url: str,
+        source: SourceProfile
+    ) -> bool:
+        """
+        Use AI to determine if a link should be followed.
+
+        Args:
+            link_url: The link to evaluate
+            source_url: The page containing the link
+            source: SourceProfile with crawl settings
+
+        Returns:
+            True if link should be followed
+        """
+        # Check max_depth first (hard constraint)
+        if source.crawl_settings.max_depth == 0:
+            return False
+
+        # Basic depth check using path segments
+        source_depth = len(urlparse(source_url).path.strip('/').split('/'))
+        link_depth = len(urlparse(link_url).path.strip('/').split('/'))
+
+        if link_depth > source_depth + source.crawl_settings.max_depth:
+            return False
+
+        # Use AI to make intelligent decision
+        try:
+            confidence = self._ai_evaluate_link_relevance(
+                link_url,
+                source_url,
+                source
+            )
+            return confidence >= self.min_confidence
+        except Exception:
+            # Fallback to conservative approach
+            return False
+
+    def group_related_pages(
+        self,
+        urls: List[str],
+        metadata: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    ) -> List[DocumentGroup]:
+        """
+        Use AI to group related URLs based on semantic similarity.
+
+        Args:
+            urls: List of URLs to analyze
+            metadata: Optional extracted metadata for each URL
+
+        Returns:
+            List of DocumentGroup objects
+        """
+        if not self.enable_smart_grouping or len(urls) < 2:
+            return []
+
+        try:
+            groups = self._ai_group_pages(urls, metadata)
+            return groups
+        except Exception:
+            # Fallback to no grouping
+            return []
+
+    # ========== Private Helper Methods ==========
+
+    def _extract_links_with_context(
+        self,
+        tree: lxml_html.HtmlElement,
+        base_url: str
+    ) -> List[Dict[str, str]]:
+        """
+        Extract links along with their contextual information.
+
+        Args:
+            tree: Parsed HTML tree
+            base_url: Base URL for resolving relative links
+
+        Returns:
+            List of dicts with 'url', 'text', 'context', 'parent_tag'
+        """
+        link_contexts = []
+
+        for element in tree.xpath('//a[@href]'):
+            href = element.get('href')
+            if not href:
+                continue
+
+            # Normalize to absolute URL
+            absolute_url = self.normalize_url(href, base_url)
+
+            if not self._is_valid_url(absolute_url):
+                continue
+
+            # Extract link text
+            link_text = element.text_content().strip()
+
+            # Extract parent context (e.g., nav, article, aside)
+            parent = element.getparent()
+            parent_tag = parent.tag if parent is not None else 'unknown'
+
+            # Get some surrounding context
+            context = self._get_element_context(element)
+
+            link_contexts.append({
+                'url': absolute_url,
+                'text': link_text[:200],  # Limit length
+                'context': context[:300],  # Limit length
+                'parent_tag': parent_tag
+            })
+
+        # Remove duplicates while preserving order
+        seen_urls = set()
+        unique_links = []
+        for link in link_contexts:
+            if link['url'] not in seen_urls:
+                seen_urls.add(link['url'])
+                unique_links.append(link)
+
+        return unique_links
+
+    def _get_element_context(self, element: lxml_html.HtmlElement) -> str:
+        """
+        Get contextual text around an element.
+
+        Args:
+            element: HTML element
+
+        Returns:
+            Context string
+        """
+        try:
+            # Try to get parent's text content
+            parent = element.getparent()
+            if parent is not None:
+                return parent.text_content().strip()[:300]
+            return ""
+        except Exception:
+            return ""
+
+    def _is_valid_url(self, url: str) -> bool:
+        """Check if URL is valid for crawling."""
+        if not url or not isinstance(url, str):
+            return False
+
+        if not (url.startswith('http://') or url.startswith('https://')):
+            return False
+
+        if url.startswith('#'):
+            return False
+
+        # Skip obvious non-content file types
+        skip_extensions = ['.pdf', '.jpg', '.jpeg', '.png', '.gif', '.zip', '.tar', '.gz', '.mp4', '.mp3']
+        if any(url.lower().endswith(ext) for ext in skip_extensions):
+            return False
+
+        return True
+
+    def _ai_filter_links(
+        self,
+        link_contexts: List[Dict[str, str]],
+        source_url: str,
+        source: SourceProfile
+    ) -> List[str]:
+        """
+        Use AI to filter and select relevant links.
+
+        Args:
+            link_contexts: List of link dictionaries with context
+            source_url: Source page URL
+            source: SourceProfile
+
+        Returns:
+            List of relevant URLs
+        """
+        # Build prompt for LLM
+        prompt = self._build_link_filtering_prompt(
+            link_contexts,
+            source_url,
+            source
+        )
+
+        # Get cache key
+        cache_key = hashlib.md5(prompt.encode()).hexdigest()
+
+        # Check cache
+        if cache_key in self._response_cache:
+            response = self._response_cache[cache_key]
+        else:
+            # Call LLM
+            response = self.llm_function(prompt)
+            self._response_cache[cache_key] = response
+
+        # Parse response to extract URLs
+        relevant_urls = self._parse_link_selection_response(response, link_contexts)
+
+        return relevant_urls
+
+    def _build_link_filtering_prompt(
+        self,
+        link_contexts: List[Dict[str, str]],
+        source_url: str,
+        source: SourceProfile
+    ) -> str:
+        """Build prompt for link filtering."""
+
+        # Format links for the prompt
+        links_text = ""
+        for i, link in enumerate(link_contexts):
+            links_text += f"{i}. [{link['text'][:100]}] {link['url']}\n"
+            links_text += f"   Context: {link['context'][:150]}\n"
+            links_text += f"   Parent tag: {link['parent_tag']}\n\n"
+
+        prompt = f"""You are analyzing a webpage to identify relevant content links to crawl.
+
+Source URL: {source_url}
+Purpose: Extract relevant content for a knowledge base / RAG system
+
+Links found on the page:
+{links_text}
+
+Task: Identify which links are most relevant for content extraction. Focus on:
+- Main content pages (articles, documentation, blog posts, guides)
+- Avoid navigation links (home, about, contact, login)
+- Avoid utility pages (search, RSS feeds, social media)
+- Avoid pagination or duplicate content
+- Prioritize links that seem to contain substantial textual content
+
+Respond with ONLY a JSON array of link indices (0-based) that should be followed.
+Example: [0, 2, 5, 7]
+
+Response:"""
+
+        return prompt
+
+    def _parse_link_selection_response(
+        self,
+        response: str,
+        link_contexts: List[Dict[str, str]]
+    ) -> List[str]:
+        """
+        Parse LLM response to extract selected URLs.
+
+        Args:
+            response: LLM response
+            link_contexts: Original link contexts
+
+        Returns:
+            List of selected URLs
+        """
+        try:
+            # Extract JSON array from response
+            json_match = re.search(r'\[[\d,\s]+\]', response)
+            if not json_match:
+                return []
+
+            indices = json.loads(json_match.group())
+
+            # Extract URLs at those indices
+            selected_urls = []
+            for idx in indices:
+                if 0 <= idx < len(link_contexts):
+                    selected_urls.append(link_contexts[idx]['url'])
+
+            return selected_urls
+        except Exception:
+            return []
+
+    def _ai_evaluate_link_relevance(
+        self,
+        link_url: str,
+        source_url: str,
+        source: SourceProfile
+    ) -> float:
+        """
+        Use AI to evaluate link relevance with a confidence score.
+
+        Args:
+            link_url: Link to evaluate
+            source_url: Source page
+            source: SourceProfile
+
+        Returns:
+            Confidence score (0.0 to 1.0)
+        """
+        prompt = f"""Evaluate if this link should be followed for content extraction.
+
+Source URL: {source_url}
+Target Link: {link_url}
+
+Consider:
+- Is this likely a content page (article, documentation, guide)?
+- Does it fit the same domain/topic as the source?
+- Is it likely to contain valuable textual content?
+
+Respond with ONLY a confidence score from 0.0 to 1.0.
+- 1.0 = Definitely follow (high-value content)
+- 0.5 = Uncertain (might be content)
+- 0.0 = Don't follow (navigation/utility page)
+
+Score:"""
+
+        # Get cache key
+        cache_key = hashlib.md5(prompt.encode()).hexdigest()
+
+        # Check cache
+        if cache_key in self._response_cache:
+            response = self._response_cache[cache_key]
+        else:
+            response = self.llm_function(prompt)
+            self._response_cache[cache_key] = response
+
+        # Parse score
+        try:
+            # Extract first number from response
+            match = re.search(r'([0-1]\.?\d*)', response)
+            if match:
+                score = float(match.group(1))
+                return min(max(score, 0.0), 1.0)  # Clamp to [0, 1]
+            return 0.5  # Default to uncertain
+        except Exception:
+            return 0.5
+
+    def _ai_group_pages(
+        self,
+        urls: List[str],
+        metadata: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    ) -> List[DocumentGroup]:
+        """
+        Use AI to intelligently group related pages.
+
+        Args:
+            urls: URLs to group
+            metadata: Optional metadata
+
+        Returns:
+            List of DocumentGroup objects
+        """
+        if len(urls) < 2:
+            return []
+
+        # Build prompt
+        prompt = self._build_grouping_prompt(urls, metadata)
+
+        # Get cache key
+        cache_key = hashlib.md5(prompt.encode()).hexdigest()
+
+        # Check cache
+        if cache_key in self._response_cache:
+            response = self._response_cache[cache_key]
+        else:
+            response = self.llm_function(prompt)
+            self._response_cache[cache_key] = response
+
+        # Parse grouping response
+        groups = self._parse_grouping_response(response, urls, metadata)
+
+        return groups
+
+    def _build_grouping_prompt(
+        self,
+        urls: List[str],
+        metadata: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    ) -> str:
+        """Build prompt for page grouping."""
+
+        urls_text = ""
+        for i, url in enumerate(urls):
+            urls_text += f"{i}. {url}\n"
+
+            # Add metadata if available
+            if metadata and url in metadata:
+                meta = metadata[url]
+                if meta and isinstance(meta, list) and meta:
+                    title = meta[0].get('title', 'N/A')
+                    urls_text += f"   Title: {title}\n"
+
+        prompt = f"""Analyze these URLs to identify groups of related pages.
+
+URLs:
+{urls_text}
+
+Task: Identify groups of related pages such as:
+- Multi-page articles (same content split across pages)
+- Article series (related topics)
+- Documentation sections (related docs)
+
+Respond with ONLY a JSON array of groups. Each group is an object with:
+- "indices": array of URL indices (0-based)
+- "relationship": string ("multi_page" or "series" or "related")
+- "title": string (optional group title)
+
+Example:
+[
+  {{"indices": [0, 1, 2], "relationship": "multi_page", "title": "Complete Guide"}},
+  {{"indices": [5, 8], "relationship": "series", "title": "Tutorial Series"}}
+]
+
+If no clear groups, respond with empty array: []
+
+Response:"""
+
+        return prompt
+
+    def _parse_grouping_response(
+        self,
+        response: str,
+        urls: List[str],
+        metadata: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    ) -> List[DocumentGroup]:
+        """
+        Parse AI grouping response into DocumentGroup objects.
+
+        Args:
+            response: LLM response
+            urls: Original URLs
+            metadata: Optional metadata
+
+        Returns:
+            List of DocumentGroup objects
+        """
+        try:
+            # Extract JSON array
+            json_match = re.search(r'\[.*\]', response, re.DOTALL)
+            if not json_match:
+                return []
+
+            groups_data = json.loads(json_match.group())
+
+            document_groups = []
+            for group_data in groups_data:
+                indices = group_data.get('indices', [])
+                if len(indices) < 2:
+                    continue
+
+                # Get URLs for this group
+                group_urls = [urls[i] for i in indices if 0 <= i < len(urls)]
+                if not group_urls:
+                    continue
+
+                # Create DocumentGroup
+                primary_url = group_urls[0]
+                group_id = self._generate_group_id(primary_url)
+
+                relationship_type = group_data.get('relationship', 'related')
+                title = group_data.get('title')
+
+                document_groups.append(DocumentGroup(
+                    group_id=group_id,
+                    source_url=primary_url,
+                    page_urls=group_urls,
+                    title=title,
+                    relationship_type=relationship_type,
+                    metadata={}
+                ))
+
+            return document_groups
+
+        except Exception:
+            return []
+
+    def _generate_group_id(self, url: str) -> str:
+        """Generate unique group ID from URL."""
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+        return f"ai_group_{url_hash}"

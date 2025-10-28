@@ -4,6 +4,7 @@ from webrag.schemas.source_profile import SourceProfile, CrawlSettings
 from webrag.schemas.document import (
     ExtractionResult,
     DocumentChunk,
+    DocumentGroup,
     ContentType
 )
 from webrag.schemas.response import PipelineResult
@@ -13,6 +14,7 @@ __all__ = [
     "CrawlSettings",
     "ExtractionResult",
     "DocumentChunk",
+    "DocumentGroup",
     "ContentType",
     "PipelineResult",
 ]

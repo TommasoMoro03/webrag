@@ -203,6 +203,26 @@ class DocumentChunk(BaseModel):
         description="Approximate token count for LLM context planning"
     )
 
+    # Grouping fields for multi-page content
+    document_group_id: Optional[str] = Field(
+        default=None,
+        description="ID linking chunks from the same logical document (e.g., article across multiple pages)"
+    )
+    page_url: Optional[HttpUrl] = Field(
+        default=None,
+        description="Specific page URL if different from source_url (for multi-page articles)"
+    )
+    page_index: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Page number within the document group (0-based)"
+    )
+    total_pages: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Total pages in the document group"
+    )
+
     class Config:
         json_schema_extra = {
             "example": {
@@ -222,5 +242,57 @@ class DocumentChunk(BaseModel):
                 "confidence_score": 0.95,
                 "chunking_strategy": "semantic",
                 "token_count": 150
+            }
+        }
+
+
+class DocumentGroup(BaseModel):
+    """
+    Represents a logical group of related pages/content.
+
+    Used when crawling discovers multiple pages that belong to the same article/document.
+    For example, a blog post index page that links to full article pages.
+    """
+
+    group_id: str = Field(
+        ...,
+        description="Unique identifier for this document group"
+    )
+    source_url: HttpUrl = Field(
+        ...,
+        description="Original source URL that led to this group (e.g., index page)"
+    )
+    page_urls: List[HttpUrl] = Field(
+        default_factory=list,
+        description="List of all page URLs belonging to this group"
+    )
+    title: Optional[str] = Field(
+        default=None,
+        description="Title of the document/article"
+    )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Shared metadata for the group"
+    )
+    relationship_type: Optional[str] = Field(
+        default="multi_page_article",
+        description="Type of relationship (e.g., 'multi_page_article', 'article_index', 'series')"
+    )
+    discovered_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        description="When this group was discovered"
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "group_id": "article_12345",
+                "source_url": "https://example.com/blog",
+                "page_urls": [
+                    "https://example.com/blog/article-1",
+                    "https://example.com/blog/article-1/page-2"
+                ],
+                "title": "Complete Article Title",
+                "relationship_type": "multi_page_article"
             }
         }
