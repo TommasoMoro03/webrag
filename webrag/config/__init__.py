@@ -1,16 +1,15 @@
-"""Configuration module for web-rag."""
+"""Configuration management for WebRAG, especially AI/LLM integration."""
 
-from webrag.config.constants import *
+from webrag.config.ai_config import (
+    AIConfig,
+    AIProvider,
+    detect_available_providers,
+    get_default_llm_function,
+)
 
 __all__ = [
-    "LIBRARY_NAME",
-    "VERSION",
-    "USER_AGENT",
-    "DEFAULT_TIMEOUT",
-    "DEFAULT_RATE_LIMIT_DELAY",
-    "DEFAULT_MAX_RETRIES",
-    "DEFAULT_CHUNK_SIZE",
-    "DEFAULT_CHUNK_OVERLAP",
-    "SUPPORTED_EXPORT_FORMATS",
-    "DEFAULT_EXPORT_FORMAT",
+    "AIConfig",
+    "AIProvider",
+    "detect_available_providers",
+    "get_default_llm_function",
 ]

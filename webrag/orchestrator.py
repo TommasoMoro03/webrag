@@ -23,6 +23,7 @@ from webrag.extractors import BaseExtractor
 from webrag.chunking import BaseChunker
 from webrag.output import BaseExporter
 from webrag.crawler import BaseCrawler
+from webrag.config import AIConfig
 from webrag.utils.exceptions import (
     PipelineError,
     ConfigurationError,
@@ -57,6 +58,7 @@ class WebRAG:
         chunker: Optional[BaseChunker] = None,
         exporter: Optional[BaseExporter] = None,
         crawler: Optional[BaseCrawler] = None,
+        ai_config: Optional[AIConfig] = None,
         enable_crawling: bool = True,
         fail_fast: bool = False,
         verbose: bool = False,
@@ -73,7 +75,8 @@ class WebRAG:
             extractor: Custom extractor instance (if None, uses default)
             chunker: Custom chunker instance (if None, uses default)
             exporter: Custom exporter instance (if None, uses default)
-            crawler: Custom crawler instance (if None, uses default when enable_crawling=True)
+            crawler: Custom crawler instance (if None, auto-selects based on AI availability)
+            ai_config: AI configuration (if None, auto-detects from environment)
             enable_crawling: Enable link discovery and multi-page crawling (default: True)
             fail_fast: If True, stop on first error; if False, collect errors and continue
             verbose: Enable verbose logging
@@ -100,6 +103,13 @@ class WebRAG:
         self.fail_fast = fail_fast
         self.verbose = verbose
         self.enable_crawling = enable_crawling
+
+        # AI configuration - auto-detect if not provided
+        self.ai_config = ai_config or AIConfig.from_env()
+        if self.ai_config.enabled:
+            logger.info(f"AI features enabled with provider: {self.ai_config.provider}")
+        else:
+            logger.info("AI features disabled (no provider detected)")
 
         # Initialize pipeline components
         self.fetcher = fetcher or self._get_default_fetcher()
@@ -180,9 +190,39 @@ class WebRAG:
             )
 
     def _get_default_crawler(self) -> BaseCrawler:
-        """Get default crawler implementation."""
+        """
+        Get default crawler implementation with smart selection.
+
+        Uses AI crawler if:
+        1. AI is enabled in config
+        2. AICrawler implementation is available
+
+        Otherwise falls back to SimpleCrawler.
+        """
+        # Try AI crawler first if AI is enabled
+        if self.ai_config.enabled:
+            try:
+                from webrag.crawler.ai_crawler import AICrawler
+
+                # Get LLM function from config
+                llm_function = self.ai_config.get_llm_function()
+
+                logger.info("Using AI-powered crawler")
+                return AICrawler(
+                    llm_function=llm_function,
+                    max_links_per_page=50,
+                    min_confidence=0.6,
+                    enable_smart_grouping=True,
+                )
+            except ImportError as e:
+                logger.warning(f"AI crawler not available: {e}, falling back to SimpleCrawler")
+            except Exception as e:
+                logger.warning(f"Could not initialize AI crawler: {e}, falling back to SimpleCrawler")
+
+        # Fallback to SimpleCrawler
         try:
             from webrag.crawler.simple_crawler import SimpleCrawler
+            logger.info("Using heuristic-based SimpleCrawler")
             return SimpleCrawler()
         except ImportError:
             logger.warning(
