@@ -359,14 +359,20 @@ class WebRAG:
             List of DocumentChunk objects
         """
         # Step 1: Fetch
+        logger.info(f"  [SIMPLE 1/3] Fetching page...")
         fetch_result = self._fetch_source(source)
+        logger.info(f"    ✓ Fetched {len(fetch_result.get('content', ''))} bytes in {fetch_result.get('fetch_time_ms', 0)}ms")
 
         # Step 2: Extract
+        logger.info(f"  [SIMPLE 2/3] Extracting content...")
         extraction_result = self._extract_content(fetch_result, source)
         self._extraction_results.append(extraction_result)
+        logger.info(f"    ✓ Extracted {len(extraction_result.content)} chars, title: '{extraction_result.title}'")
 
         # Step 3: Chunk
+        logger.info(f"  [SIMPLE 3/3] Chunking content...")
         chunks = self._chunk_content(extraction_result)
+        logger.info(f"    ✓ Created {len(chunks)} chunk(s)")
 
         return chunks
 
@@ -391,24 +397,32 @@ class WebRAG:
         all_chunks = []
 
         # Step 1: Fetch source page
-        logger.info(f"  [1/6] Fetching source page: {source.url}")
+        logger.info(f"  [CRAWL 1/6] Fetching source page: {source.url}")
         source_fetch_result = self._fetch_source(source)
+        logger.info(f"    ✓ Fetched {len(source_fetch_result.get('content', ''))} bytes in {source_fetch_result.get('fetch_time_ms', 0)}ms")
         self.crawler.mark_visited(str(source.url))
 
         # Step 2: Discover links
-        logger.info(f"  [2/6] Discovering links from source page...")
+        logger.info(f"  [CRAWL 2/6] Discovering links from source page...")
         discovered_links = self.crawler.discover_links(
             source_fetch_result['content'],
             str(source.url),
             source
         )
-        logger.info(f"  Found {len(discovered_links)} link(s) to crawl")
+        logger.info(f"    ✓ Discovered {len(discovered_links)} relevant link(s) to crawl")
+        if discovered_links:
+            logger.info(f"    Sample links: {discovered_links[:3]}")
 
         # Step 3: Fetch discovered pages
-        logger.info(f"  [3/6] Fetching discovered pages...")
+        max_pages = source.crawl_settings.max_pages or len(discovered_links)
+        links_to_fetch = discovered_links[:max_pages]
+        logger.info(f"  [CRAWL 3/6] Fetching {len(links_to_fetch)} discovered pages (max_pages={max_pages})...")
+
         discovered_fetch_results = {}
-        for link in discovered_links[:source.crawl_settings.max_pages or len(discovered_links)]:
+        for idx, link in enumerate(links_to_fetch, 1):
             try:
+                logger.info(f"    [{idx}/{len(links_to_fetch)}] Fetching: {link}")
+
                 # Create temporary source profile for discovered page
                 temp_source = SourceProfile(
                     url=link,
@@ -419,44 +433,63 @@ class WebRAG:
                 fetch_result = self._fetch_source(temp_source)
                 discovered_fetch_results[link] = fetch_result
                 self.crawler.mark_visited(link)
+
+                logger.info(f"      ✓ Success ({fetch_result.get('fetch_time_ms', 0)}ms)")
             except Exception as e:
-                logger.warning(f"  Failed to fetch {link}: {e}")
+                logger.warning(f"      ✗ Failed: {e}")
                 continue
 
+        logger.info(f"    ✓ Successfully fetched {len(discovered_fetch_results)}/{len(links_to_fetch)} pages")
+
         # Step 4: Group related pages
-        logger.info(f"  [4/6] Grouping related pages...")
+        logger.info(f"  [CRAWL 4/6] Grouping related pages...")
         all_urls = [str(source.url)] + list(discovered_fetch_results.keys())
+        logger.info(f"    Analyzing {len(all_urls)} total URLs for relationships...")
+
         document_groups = self.crawler.group_related_pages(all_urls)
         self._document_groups.extend(document_groups)
-        logger.info(f"  Created {len(document_groups)} document group(s)")
+
+        if document_groups:
+            logger.info(f"    ✓ Created {len(document_groups)} document group(s):")
+            for group in document_groups:
+                logger.info(f"      • Group '{group.group_id}': {len(group.page_urls)} pages ({group.relationship_type})")
+        else:
+            logger.info(f"    ✓ No groups created (all pages will be processed individually)")
 
         # Step 5: Extract content from all pages
-        logger.info(f"  [5/6] Extracting content from all pages...")
+        logger.info(f"  [CRAWL 5/6] Extracting content from {len(all_urls)} pages...")
         extractions_by_url = {}
 
         # Extract source page
         try:
+            logger.info(f"    [1/{len(all_urls)}] Extracting: {source.url}")
             source_extraction = self._extract_content(source_fetch_result, source)
             extractions_by_url[str(source.url)] = source_extraction
             self._extraction_results.append(source_extraction)
+            logger.info(f"      ✓ Extracted {len(source_extraction.content)} chars, title: '{source_extraction.title}'")
         except Exception as e:
-            logger.warning(f"  Failed to extract from {source.url}: {e}")
+            logger.warning(f"      ✗ Failed: {e}")
 
         # Extract discovered pages
-        for url, fetch_result in discovered_fetch_results.items():
+        for idx, (url, fetch_result) in enumerate(discovered_fetch_results.items(), 2):
             try:
+                logger.info(f"    [{idx}/{len(all_urls)}] Extracting: {url}")
                 temp_source = SourceProfile(url=url, type=source.type, enabled=source.enabled)
                 extraction = self._extract_content(fetch_result, temp_source)
                 extractions_by_url[url] = extraction
                 self._extraction_results.append(extraction)
+                logger.info(f"      ✓ Extracted {len(extraction.content)} chars")
             except Exception as e:
-                logger.warning(f"  Failed to extract from {url}: {e}")
+                logger.warning(f"      ✗ Failed: {e}")
                 continue
 
+        logger.info(f"    ✓ Successfully extracted {len(extractions_by_url)}/{len(all_urls)} pages")
+
         # Step 6: Chunk with group associations
-        logger.info(f"  [6/6] Chunking content with group associations...")
+        logger.info(f"  [CRAWL 6/6] Chunking content...")
 
         if document_groups:
+            logger.info(f"    Processing {len(document_groups)} document groups...")
             # Process grouped pages
             for group in document_groups:
                 group_chunks = self._chunk_document_group(group, extractions_by_url)
@@ -467,22 +500,30 @@ class WebRAG:
             for group in document_groups:
                 grouped_urls.update(str(url) for url in group.page_urls)
 
+            ungrouped_count = len([url for url in extractions_by_url.keys() if url not in grouped_urls])
+            if ungrouped_count > 0:
+                logger.info(f"    Processing {ungrouped_count} ungrouped pages...")
+
             for url, extraction in extractions_by_url.items():
                 if url not in grouped_urls:
                     try:
                         chunks = self._chunk_content(extraction)
                         all_chunks.extend(chunks)
+                        logger.info(f"      ✓ Chunked {url}: {len(chunks)} chunks")
                     except Exception as e:
-                        logger.warning(f"  Failed to chunk {url}: {e}")
+                        logger.warning(f"      ✗ Failed to chunk {url}: {e}")
         else:
             # No groups created, process all individually
-            for extraction in extractions_by_url.values():
+            logger.info(f"    Processing all {len(extractions_by_url)} pages individually...")
+            for url, extraction in extractions_by_url.items():
                 try:
                     chunks = self._chunk_content(extraction)
                     all_chunks.extend(chunks)
+                    logger.info(f"      ✓ Chunked {url}: {len(chunks)} chunks")
                 except Exception as e:
-                    logger.warning(f"  Failed to chunk content: {e}")
+                    logger.warning(f"      ✗ Failed to chunk: {e}")
 
+        logger.info(f"    ✓ Total chunks created: {len(all_chunks)}")
         return all_chunks
 
     def _chunk_document_group(

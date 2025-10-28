@@ -27,9 +27,9 @@ class CrawlSettings(BaseModel):
         description="Whether to respect robots.txt rules"
     )
     rate_limit_delay: float = Field(
-        default=1.0,
+        default=2.0,
         ge=0.0,
-        description="Delay in seconds between requests"
+        description="Delay in seconds between requests (default: 2s to avoid bans)"
     )
     timeout: int = Field(
         default=30,
