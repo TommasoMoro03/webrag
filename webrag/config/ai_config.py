@@ -138,8 +138,8 @@ class AIConfig(BaseModel):
             AIConfig instance
 
         Examples:
-            >>> config = AIConfig.from_env()  # Auto-detect
-            >>> config = AIConfig.from_env(AIProvider.OPENAI)  # Force OpenAI
+            config = AIConfig.from_env()  # Auto-detect
+            config = AIConfig.from_env(AIProvider.OPENAI)  # Force OpenAI
         """
         if provider:
             # User specified provider explicitly
@@ -185,9 +185,9 @@ class AIConfig(BaseModel):
             AIConfig instance
 
         Examples:
-            >>> def my_llm(prompt: str) -> str:
-            ...     return my_model.generate(prompt)
-            >>> config = AIConfig.from_function(my_llm)
+             def my_llm(prompt: str) -> str:
+                 return my_model.generate(prompt)
+             config = AIConfig.from_function(my_llm)
         """
         config = cls(
             enabled=True,
@@ -207,7 +207,7 @@ class AIConfig(BaseModel):
             AIConfig with enabled=False
 
         Examples:
-            >>> config = AIConfig.disabled()
+            config = AIConfig.disabled()
         """
         return cls(enabled=False)
 
@@ -261,9 +261,9 @@ class AIConfig(BaseModel):
             ImportError: If required library not installed
 
         Examples:
-            >>> config = AIConfig.from_env()
-            >>> llm = config.get_llm_function()
-            >>> response = llm("What is 2+2?")
+            config = AIConfig.from_env()
+            llm = config.get_llm_function()
+            response = llm("What is 2+2?")
         """
         if not self.enabled:
             raise ValueError("AI features are disabled")

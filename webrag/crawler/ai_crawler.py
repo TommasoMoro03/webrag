@@ -45,7 +45,7 @@ class AICrawler(BaseCrawler):
         """
         super().__init__(**kwargs)
         self.llm_function = llm_function
-        self.max_links_per_page = kwargs.get('max_links_per_page', 50)
+        self.max_links_per_page = kwargs.get('max_links_per_page', 200)
         self.min_confidence = kwargs.get('min_confidence', 0.6)
         self.enable_smart_grouping = kwargs.get('enable_smart_grouping', True)
         self.temperature = kwargs.get('temperature', 0.3)
@@ -297,8 +297,12 @@ class AICrawler(BaseCrawler):
             response = self.llm_function(prompt)
             self._response_cache[cache_key] = response
 
+        print("LLM RESPONSE:", response)
+
         # Parse response to extract URLs
         relevant_urls = self._parse_link_selection_response(response, link_contexts)
+
+        print("RELEVANT URLS:", relevant_urls)
 
         return relevant_urls
 
@@ -317,6 +321,8 @@ class AICrawler(BaseCrawler):
             links_text += f"   Context: {link['context'][:150]}\n"
             links_text += f"   Parent tag: {link['parent_tag']}\n\n"
 
+        print("LINKS TEXT:", links_text)
+
         prompt = f"""You are analyzing a webpage to identify relevant content links to crawl.
 
 Source URL: {source_url}
@@ -329,8 +335,10 @@ Task: Identify which links are most relevant for content extraction. Focus on:
 - Main content pages (articles, documentation, blog posts, guides)
 - Avoid navigation links (home, about, contact, login)
 - Avoid utility pages (search, RSS feeds, social media)
+- Avoid links to media files or downloads
+- Avoid links that suggest pages with categories or tags, not specific readable content
 - Avoid pagination or duplicate content
-- Prioritize links that seem to contain substantial textual content
+- Prioritize links that seem to contain substantial textual content, useful for RAG systems
 
 Respond with ONLY a JSON array of link indices (0-based) that should be followed.
 Example: [0, 2, 5, 7]

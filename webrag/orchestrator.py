@@ -26,11 +26,17 @@ from webrag.crawler import BaseCrawler
 from webrag.config import AIConfig
 from webrag.utils.exceptions import (
     PipelineError,
-    ConfigurationError,
     FetchError,
     ExtractionError,
     ChunkingError,
     ExportError,
+)
+from webrag.utils.default_components import (
+    _get_default_fetcher,
+    _get_default_extractor,
+    _get_default_chunker,
+    _get_default_exporter,
+    _get_default_crawler,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,15 +45,6 @@ logger = logging.getLogger(__name__)
 class WebRAG:
     """
     Main orchestrator class for the WebRAG pipeline.
-
-    This class provides a simple, chainable API for ingesting websites
-    into RAG-ready document chunks.
-
-    Example:
-        >>> rag = WebRAG("sources.json")
-        >>> rag.build()
-        >>> rag.export(format="json")
-        >>> rag.save("output/results.json")
     """
 
     def __init__(
@@ -112,11 +109,11 @@ class WebRAG:
             logger.info("AI features disabled (no provider detected)")
 
         # Initialize pipeline components
-        self.fetcher = fetcher or self._get_default_fetcher()
-        self.extractor = extractor or self._get_default_extractor()
-        self.chunker = chunker or self._get_default_chunker()
-        self.exporter = exporter or self._get_default_exporter()
-        self.crawler = crawler or (self._get_default_crawler() if enable_crawling else None)
+        self.fetcher = fetcher or _get_default_fetcher()
+        self.extractor = extractor or _get_default_extractor()
+        self.chunker = chunker or _get_default_chunker()
+        self.exporter = exporter or _get_default_exporter()
+        self.crawler = crawler or (_get_default_crawler(self.ai_config) if enable_crawling else None)
 
         # Pipeline state
         self.result: Optional[PipelineResult] = None
@@ -127,112 +124,6 @@ class WebRAG:
         self._warnings: List[str] = []
         self._started_at: Optional[datetime] = None
         self._completed_at: Optional[datetime] = None
-
-    def _get_default_fetcher(self) -> BaseFetcher:
-        """Get default fetcher implementation."""
-        # Try to import and use a concrete implementation
-        try:
-            from webrag.fetcher.static_fetcher import StaticFetcher
-            return StaticFetcher()
-        except ImportError:
-            logger.warning(
-                "No concrete fetcher implementation found. "
-                "Please implement StaticFetcher or provide a custom fetcher."
-            )
-            raise ConfigurationError(
-                "No fetcher available. Please provide a fetcher instance or "
-                "implement webrag.fetcher.static_fetcher.StaticFetcher"
-            )
-
-    def _get_default_extractor(self) -> BaseExtractor:
-        """Get default extractor implementation."""
-        try:
-            from webrag.extractors.trafilatura_extractor import TrafilaturaExtractor
-            return TrafilaturaExtractor()
-        except ImportError:
-            logger.warning(
-                "No concrete extractor implementation found. "
-                "Please implement TrafilaturaExtractor or provide a custom extractor."
-            )
-            raise ConfigurationError(
-                "No extractor available. Please provide an extractor instance or "
-                "implement webrag.extractors.trafilatura_extractor.TrafilaturaExtractor"
-            )
-
-    def _get_default_chunker(self) -> BaseChunker:
-        """Get default chunker implementation."""
-        try:
-            from webrag.chunking.semantic_chunker import SemanticChunker
-            return SemanticChunker()
-        except ImportError:
-            logger.warning(
-                "No concrete chunker implementation found. "
-                "Please implement SemanticChunker or provide a custom chunker."
-            )
-            raise ConfigurationError(
-                "No chunker available. Please provide a chunker instance or "
-                "implement webrag.chunking.semantic_chunker.SemanticChunker"
-            )
-
-    def _get_default_exporter(self) -> BaseExporter:
-        """Get default exporter implementation."""
-        try:
-            from webrag.output.json_exporter import JSONExporter
-            return JSONExporter()
-        except ImportError:
-            logger.warning(
-                "No concrete exporter implementation found. "
-                "Please implement JSONExporter or provide a custom exporter."
-            )
-            raise ConfigurationError(
-                "No exporter available. Please provide an exporter instance or "
-                "implement webrag.output.json_exporter.JSONExporter"
-            )
-
-    def _get_default_crawler(self) -> BaseCrawler:
-        """
-        Get default crawler implementation with smart selection.
-
-        Uses AI crawler if:
-        1. AI is enabled in config
-        2. AICrawler implementation is available
-
-        Otherwise falls back to SimpleCrawler.
-        """
-        # Try AI crawler first if AI is enabled
-        if self.ai_config.enabled:
-            try:
-                from webrag.crawler.ai_crawler import AICrawler
-
-                # Get LLM function from config
-                llm_function = self.ai_config.get_llm_function()
-
-                logger.info("Using AI-powered crawler")
-                return AICrawler(
-                    llm_function=llm_function,
-                    max_links_per_page=50,
-                    min_confidence=0.6,
-                    enable_smart_grouping=True,
-                )
-            except ImportError as e:
-                logger.warning(f"AI crawler not available: {e}, falling back to SimpleCrawler")
-            except Exception as e:
-                logger.warning(f"Could not initialize AI crawler: {e}, falling back to SimpleCrawler")
-
-        # Fallback to SimpleCrawler
-        try:
-            from webrag.crawler.simple_crawler import SimpleCrawler
-            logger.info("Using heuristic-based SimpleCrawler")
-            return SimpleCrawler()
-        except ImportError:
-            logger.warning(
-                "No concrete crawler implementation found. "
-                "Please implement SimpleCrawler or provide a custom crawler."
-            )
-            raise ConfigurationError(
-                "No crawler available. Please provide a crawler instance or "
-                "implement webrag.crawler.simple_crawler.SimpleCrawler"
-            )
 
     def build(self) -> "WebRAG":
         """
