@@ -10,7 +10,6 @@ import logging
 
 from webrag.crawler.base import BaseCrawler
 from webrag.schemas.source_profile import SourceProfile
-from webrag.schemas.document import DocumentGroup
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +21,6 @@ class AICrawler(BaseCrawler):
     This implementation:
     - Uses AI to analyze HTML and determine which links are relevant
     - Intelligently decides which links to follow based on content understanding
-    - Groups related pages using semantic similarity and content analysis
     - Adapts to different website structures without hardcoded rules
 
     The crawler requires an LLM function to be provided during initialization.
@@ -40,9 +38,8 @@ class AICrawler(BaseCrawler):
             llm_function: A callable that takes a prompt (str) and returns an LLM response (str)
                          Should be a simple function like: lambda prompt: client.chat(prompt)
             **kwargs: Configuration options
-                - max_links_per_page: Maximum links to analyze per page (default: 50)
+                - max_links_per_page: Maximum links to analyze per page (default: 200)
                 - min_confidence: Minimum confidence score for following links (default: 0.6)
-                - enable_smart_grouping: Use AI for page grouping (default: True)
                 - temperature: LLM temperature for creativity (default: 0.3)
                 - extraction_selector: CSS selector for content area (default: 'body')
         """
@@ -50,7 +47,6 @@ class AICrawler(BaseCrawler):
         self.llm_function = llm_function
         self.max_links_per_page = kwargs.get('max_links_per_page', 200)
         self.min_confidence = kwargs.get('min_confidence', 0.6)
-        self.enable_smart_grouping = kwargs.get('enable_smart_grouping', True)
         self.temperature = kwargs.get('temperature', 0.3)
         self.extraction_selector = kwargs.get('extraction_selector', 'body')
 
@@ -194,39 +190,6 @@ class AICrawler(BaseCrawler):
         # For AICrawler, most validation happens in discover_links()
         # This is just a basic sanity check
         return True
-
-    def group_related_pages(
-        self,
-        urls: List[str],
-        metadata: Optional[Dict[str, List[Dict[str, Any]]]] = None,
-        source: Optional[SourceProfile] = None
-    ) -> List[DocumentGroup]:
-        """
-        Use AI to group related URLs based on semantic similarity.
-
-        Args:
-            urls: List of URLs to analyze
-            metadata: Optional extracted metadata for each URL
-            source: Optional SourceProfile to check ai_enable_grouping setting
-
-        Returns:
-            List of DocumentGroup objects
-        """
-        # Check if grouping is disabled in source settings
-        if source and not source.crawl_settings.ai_enable_grouping:
-            logger.info("AI grouping disabled in crawl_settings")
-            return []
-
-        if not self.enable_smart_grouping or len(urls) < 2:
-            return []
-
-        try:
-            groups = self._ai_group_pages(urls, metadata)
-            return groups
-        except Exception as e:
-            logger.warning(f"AI grouping failed: {e}")
-            # Fallback to no grouping
-            return []
 
     # ========== Private Helper Methods ==========
 
@@ -538,146 +501,3 @@ Score:"""
             return 0.5  # Default to uncertain
         except Exception:
             return 0.5
-
-    def _ai_group_pages(
-        self,
-        urls: List[str],
-        metadata: Optional[Dict[str, List[Dict[str, Any]]]] = None
-    ) -> List[DocumentGroup]:
-        """
-        Use AI to intelligently group related pages.
-
-        Args:
-            urls: URLs to group
-            metadata: Optional metadata
-
-        Returns:
-            List of DocumentGroup objects
-        """
-        if len(urls) < 2:
-            return []
-
-        # Build prompt
-        prompt = self._build_grouping_prompt(urls, metadata)
-
-        # Get cache key
-        cache_key = hashlib.md5(prompt.encode()).hexdigest()
-
-        # Check cache
-        if cache_key in self._response_cache:
-            response = self._response_cache[cache_key]
-        else:
-            response = self.llm_function(prompt)
-            self._response_cache[cache_key] = response
-
-        # Parse grouping response
-        groups = self._parse_grouping_response(response, urls, metadata)
-
-        return groups
-
-    def _build_grouping_prompt(
-        self,
-        urls: List[str],
-        metadata: Optional[Dict[str, List[Dict[str, Any]]]] = None
-    ) -> str:
-        """Build prompt for page grouping."""
-
-        urls_text = ""
-        for i, url in enumerate(urls):
-            urls_text += f"{i}. {url}\n"
-
-            # Add metadata if available
-            if metadata and url in metadata:
-                meta = metadata[url]
-                if meta and isinstance(meta, list) and meta:
-                    title = meta[0].get('title', 'N/A')
-                    urls_text += f"   Title: {title}\n"
-
-        prompt = f"""Analyze these URLs to identify groups of related pages.
-
-URLs:
-{urls_text}
-
-Task: Identify groups of related pages such as:
-- Multi-page articles (same content split across pages)
-- Article series (related topics)
-- Documentation sections (related docs)
-
-Respond with ONLY a JSON array of groups. Each group is an object with:
-- "indices": array of URL indices (0-based)
-- "relationship": string ("multi_page" or "series" or "related")
-- "title": string (optional group title)
-
-Example:
-[
-  {{"indices": [0, 1, 2], "relationship": "multi_page", "title": "Complete Guide"}},
-  {{"indices": [5, 8], "relationship": "series", "title": "Tutorial Series"}}
-]
-
-If no clear groups, respond with empty array: []
-
-Response:"""
-
-        return prompt
-
-    def _parse_grouping_response(
-        self,
-        response: str,
-        urls: List[str],
-        metadata: Optional[Dict[str, List[Dict[str, Any]]]] = None
-    ) -> List[DocumentGroup]:
-        """
-        Parse AI grouping response into DocumentGroup objects.
-
-        Args:
-            response: LLM response
-            urls: Original URLs
-            metadata: Optional metadata
-
-        Returns:
-            List of DocumentGroup objects
-        """
-        try:
-            # Extract JSON array
-            json_match = re.search(r'\[.*\]', response, re.DOTALL)
-            if not json_match:
-                return []
-
-            groups_data = json.loads(json_match.group())
-
-            document_groups = []
-            for group_data in groups_data:
-                indices = group_data.get('indices', [])
-                if len(indices) < 2:
-                    continue
-
-                # Get URLs for this group
-                group_urls = [urls[i] for i in indices if 0 <= i < len(urls)]
-                if not group_urls:
-                    continue
-
-                # Create DocumentGroup
-                primary_url = group_urls[0]
-                group_id = self._generate_group_id(primary_url)
-
-                relationship_type = group_data.get('relationship', 'related')
-                title = group_data.get('title')
-
-                document_groups.append(DocumentGroup(
-                    group_id=group_id,
-                    source_url=primary_url,
-                    page_urls=group_urls,
-                    title=title,
-                    relationship_type=relationship_type,
-                    metadata={}
-                ))
-
-            return document_groups
-
-        except Exception:
-            return []
-
-    def _generate_group_id(self, url: str) -> str:
-        """Generate unique group ID from URL."""
-        url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
-        return f"ai_group_{url_hash}"

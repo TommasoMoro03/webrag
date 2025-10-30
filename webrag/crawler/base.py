@@ -7,13 +7,11 @@ import re
 from pydantic import BaseModel
 
 from webrag.schemas.source_profile import SourceProfile
-from webrag.schemas.document import DocumentGroup
 
 
 class CrawlResult(BaseModel):
     """Result of a crawl operation."""
     discovered_urls: List[str]
-    document_groups: List[DocumentGroup]
     metadata: Dict[str, Any]
 
 
@@ -24,11 +22,10 @@ class BaseCrawler(ABC):
     The crawler is responsible for:
     1. Analyzing fetched content to discover links
     2. Deciding which links are relevant to follow
-    3. Grouping related pages (e.g., multi-page articles)
-    4. Respecting crawl settings (depth, patterns, robots.txt)
+    3. Respecting crawl settings (depth, patterns, robots.txt)
 
-    The crawler works AFTER fetch but BEFORE extract:
-    Fetch → Crawl/Discover → Fetch discovered pages → Extract all → Chunk
+    The crawler works AFTER fetch but BEFORE URL relationship analysis:
+    Fetch → Crawl/Discover → Fetch discovered pages → URL Relationships → Extract all → Chunk
     """
 
     def __init__(self, **kwargs):
@@ -78,26 +75,6 @@ class BaseCrawler(ABC):
 
         Returns:
             True if link should be followed
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def group_related_pages(
-        self,
-        urls: List[str],
-        metadata: Optional[Dict[str, List[Dict[str, Any]]]] = None
-    ) -> List[DocumentGroup]:
-        """
-        Group related URLs into DocumentGroup objects.
-
-        For example, detect multi-page articles, article series, etc.
-
-        Args:
-            urls: List of URLs to analyze
-            metadata: Optional extracted metadata for each URL
-
-        Returns:
-            List of DocumentGroup objects
         """
         raise NotImplementedError
 
