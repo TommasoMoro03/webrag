@@ -309,15 +309,14 @@ class WebRAG:
 
     def _process_source_with_crawling(self, source: SourceProfile) -> List[DocumentChunk]:
         """
-        Process a source with link discovery and multi-page crawling.
+        Process a source with link discovery and recursive multi-level crawling.
 
         Pipeline:
-        1. Fetch source page
-        2. Discover links using crawler
-        3. Fetch discovered pages
-        4. Group related pages
-        5. Extract content from all pages
-        6. Chunk with group associations
+        1. Fetch source page (depth=0)
+        2. Discover and fetch links iteratively up to max_depth
+        3. Group related pages
+        4. Extract content from all pages
+        5. Chunk with group associations
 
         Args:
             source: SourceProfile to process
@@ -326,55 +325,88 @@ class WebRAG:
             List of DocumentChunk objects
         """
         all_chunks = []
+        max_depth = source.crawl_settings.max_depth
+        max_pages = source.crawl_settings.max_pages
 
-        # Step 1: Fetch source page
-        logger.info(f"  [CRAWL 1/6] Fetching source page: {source.url}")
-        source_fetch_result = self._fetch_source(source)
-        logger.info(f"    ✓ Fetched {len(source_fetch_result.get('content', ''))} bytes in {source_fetch_result.get('fetch_time_ms', 0)}ms")
-        self.crawler.mark_visited(str(source.url))
+        # Track all fetched pages by URL
+        all_fetch_results = {}
 
-        # Step 2: Discover links
-        logger.info(f"  [CRAWL 2/6] Discovering links from source page...")
-        discovered_links = self.crawler.discover_links(
-            source_fetch_result['content'],
-            str(source.url),
-            source
-        )
-        logger.info(f"    ✓ Discovered {len(discovered_links)} relevant link(s) to crawl")
-        if discovered_links:
-            logger.info(f"    Sample links: {discovered_links[:3]}")
+        # Queue for BFS-style crawling: (url, depth, parent_url)
+        crawl_queue = [(str(source.url), 0, None)]
 
-        # Step 3: Fetch discovered pages
-        max_pages = source.crawl_settings.max_pages or len(discovered_links)
-        links_to_fetch = discovered_links[:max_pages]
-        logger.info(f"  [CRAWL 3/6] Fetching {len(links_to_fetch)} discovered pages (max_pages={max_pages})...")
+        # Reset crawler's visited tracking
+        self.crawler.reset()
 
-        discovered_fetch_results = {}
-        for idx, link in enumerate(links_to_fetch, 1):
+        logger.info(f"  [CRAWL] Starting crawl with max_depth={max_depth}, max_pages={max_pages or 'unlimited'}")
+
+        # Crawl iteratively (BFS approach)
+        current_depth = 0
+        pages_fetched = 0
+
+        while crawl_queue and (max_pages is None or pages_fetched < max_pages):
+            url, depth, parent_url = crawl_queue.pop(0)
+
+            # Skip if already visited
+            if url in all_fetch_results or url in self.crawler.visited_urls:
+                continue
+
+            # Check if we've exceeded max_pages
+            if max_pages and pages_fetched >= max_pages:
+                logger.info(f"    ⚠ Reached max_pages limit ({max_pages}), stopping crawl")
+                break
+
+            # Log depth changes
+            if depth > current_depth:
+                current_depth = depth
+                logger.info(f"  [CRAWL] Now crawling depth level {current_depth}/{max_depth}")
+
             try:
-                logger.info(f"    [{idx}/{len(links_to_fetch)}] Fetching: {link}")
+                # Fetch the page
+                logger.info(f"    [Depth {depth}] [{pages_fetched + 1}] Fetching: {url}")
 
-                # Create temporary source profile for discovered page
                 temp_source = SourceProfile(
-                    url=link,
+                    url=url,
                     type=source.type,
                     crawl_settings=source.crawl_settings,
                     enabled=source.enabled
                 )
                 fetch_result = self._fetch_source(temp_source)
-                discovered_fetch_results[link] = fetch_result
-                self.crawler.mark_visited(link)
+                all_fetch_results[url] = fetch_result
+                self.crawler.mark_visited(url)
+                pages_fetched += 1
 
-                logger.info(f"      ✓ Success ({fetch_result.get('fetch_time_ms', 0)}ms)")
+                logger.info(f"      ✓ Fetched ({fetch_result.get('fetch_time_ms', 0)}ms)")
+
+                # Discover links if we haven't reached max_depth
+                if depth < max_depth:
+                    logger.info(f"      Discovering links at depth {depth}...")
+
+                    discovered_links = self.crawler.discover_links(
+                        fetch_result['content'],
+                        url,
+                        source
+                    )
+
+                    logger.info(f"      ✓ Discovered {len(discovered_links)} link(s)")
+
+                    # Add discovered links to queue for next depth level
+                    for link in discovered_links:
+                        if link not in all_fetch_results and link not in self.crawler.visited_urls:
+                            crawl_queue.append((link, depth + 1, url))
+
+                else:
+                    logger.info(f"      → Max depth reached, not discovering more links from this page")
+
             except Exception as e:
-                logger.warning(f"      ✗ Failed: {e}")
+                logger.warning(f"      ✗ Failed to fetch {url}: {e}")
                 continue
 
-        logger.info(f"    ✓ Successfully fetched {len(discovered_fetch_results)}/{len(links_to_fetch)} pages")
+        logger.info(f"  [CRAWL] Crawl complete: Fetched {len(all_fetch_results)} pages across {current_depth + 1} depth level(s)")
+        logger.info(f"    Sample URLs: {list(all_fetch_results.keys())[:5]}")
 
         # Step 4: Group related pages
         logger.info(f"  [CRAWL 4/6] Grouping related pages...")
-        all_urls = [str(source.url)] + list(discovered_fetch_results.keys())
+        all_urls = list(all_fetch_results.keys())
         logger.info(f"    Analyzing {len(all_urls)} total URLs for relationships...")
 
         document_groups = self.crawler.group_related_pages(all_urls)
@@ -391,18 +423,8 @@ class WebRAG:
         logger.info(f"  [CRAWL 5/6] Extracting content from {len(all_urls)} pages...")
         extractions_by_url = {}
 
-        # Extract source page
-        try:
-            logger.info(f"    [1/{len(all_urls)}] Extracting: {source.url}")
-            source_extraction = self._extract_content(source_fetch_result, source)
-            extractions_by_url[str(source.url)] = source_extraction
-            self._extraction_results.append(source_extraction)
-            logger.info(f"      ✓ Extracted {len(source_extraction.content)} chars, title: '{source_extraction.title}'")
-        except Exception as e:
-            logger.warning(f"      ✗ Failed: {e}")
-
-        # Extract discovered pages
-        for idx, (url, fetch_result) in enumerate(discovered_fetch_results.items(), 2):
+        # Extract all pages
+        for idx, (url, fetch_result) in enumerate(all_fetch_results.items(), 1):
             try:
                 logger.info(f"    [{idx}/{len(all_urls)}] Extracting: {url}")
                 temp_source = SourceProfile(url=url, type=source.type, enabled=source.enabled)
