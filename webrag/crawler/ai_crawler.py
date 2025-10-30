@@ -6,10 +6,13 @@ from lxml import html as lxml_html
 import hashlib
 import json
 import re
+import logging
 
 from webrag.crawler.base import BaseCrawler
 from webrag.schemas.source_profile import SourceProfile
 from webrag.schemas.document import DocumentGroup
+
+logger = logging.getLogger(__name__)
 
 
 class AICrawler(BaseCrawler):
@@ -63,6 +66,12 @@ class AICrawler(BaseCrawler):
         """
         Discover links using AI analysis of HTML content.
 
+        Applies ai_validation_strategy from source.crawl_settings:
+        - 'always': Validates each URL individually (expensive)
+        - 'never': Only uses initial batch filtering
+        - 'threshold': Uses individual validation only if URLs <= threshold
+        - 'batch': Uses batch filtering (default, most efficient)
+
         Args:
             raw_content: Raw HTML content
             source_url: URL of the page being analyzed
@@ -87,12 +96,59 @@ class AICrawler(BaseCrawler):
             # Limit to avoid overwhelming the LLM
             link_contexts = link_contexts[:self.max_links_per_page]
 
-            # Use AI to analyze and filter links
-            relevant_links = self._ai_filter_links(
-                link_contexts,
-                source_url,
-                source
-            )
+            # Apply AI filtering based on strategy
+            strategy = source.crawl_settings.ai_validation_strategy
+            logger.info(f"Using AI validation strategy: {strategy}")
+
+            if strategy == "never":
+                # No AI filtering, just return all links
+                relevant_links = [link['url'] for link in link_contexts]
+                logger.info(f"Strategy 'never': Skipping AI validation, accepting all {len(relevant_links)} links")
+
+            elif strategy == "batch":
+                # Use batch filtering (default, most efficient)
+                relevant_links = self._ai_filter_links_batch(
+                    link_contexts,
+                    source_url,
+                    source
+                )
+                logger.info(f"Strategy 'batch': Filtered to {len(relevant_links)} links")
+
+            elif strategy == "threshold":
+                # Use individual validation only if under threshold
+                threshold = source.crawl_settings.ai_validation_threshold
+                if len(link_contexts) <= threshold:
+                    logger.info(f"Strategy 'threshold': {len(link_contexts)} <= {threshold}, using individual validation")
+                    relevant_links = self._ai_filter_links_individual(
+                        link_contexts,
+                        source_url,
+                        source
+                    )
+                else:
+                    logger.info(f"Strategy 'threshold': {len(link_contexts)} > {threshold}, using batch filtering")
+                    relevant_links = self._ai_filter_links_batch(
+                        link_contexts,
+                        source_url,
+                        source
+                    )
+
+            elif strategy == "always":
+                # Validate each URL individually (expensive)
+                logger.warning(f"Strategy 'always': Validating {len(link_contexts)} links individually (expensive!)")
+                relevant_links = self._ai_filter_links_individual(
+                    link_contexts,
+                    source_url,
+                    source
+                )
+
+            else:
+                # Fallback to batch
+                logger.warning(f"Unknown strategy '{strategy}', using 'batch'")
+                relevant_links = self._ai_filter_links_batch(
+                    link_contexts,
+                    source_url,
+                    source
+                )
 
             # Apply basic filters from crawl settings
             filtered_links = self.filter_links(relevant_links, source)
@@ -100,6 +156,7 @@ class AICrawler(BaseCrawler):
             return filtered_links
 
         except Exception as e:
+            logger.error(f"Error in discover_links: {e}")
             # Fallback to empty list if extraction fails
             return []
 
@@ -110,7 +167,10 @@ class AICrawler(BaseCrawler):
         source: SourceProfile
     ) -> bool:
         """
-        Use AI to determine if a link should be followed.
+        Determine if a link should be followed.
+
+        Note: This method is now mainly for basic validation.
+        AI validation happens based on ai_validation_strategy in discover_links().
 
         Args:
             link_url: The link to evaluate
@@ -118,7 +178,7 @@ class AICrawler(BaseCrawler):
             source: SourceProfile with crawl settings
 
         Returns:
-            True if link should be followed
+            True if link should be followed (basic check only)
         """
         # Check max_depth first (hard constraint)
         if source.crawl_settings.max_depth == 0:
@@ -131,22 +191,15 @@ class AICrawler(BaseCrawler):
         if link_depth > source_depth + source.crawl_settings.max_depth:
             return False
 
-        # Use AI to make intelligent decision
-        try:
-            confidence = self._ai_evaluate_link_relevance(
-                link_url,
-                source_url,
-                source
-            )
-            return confidence >= self.min_confidence
-        except Exception:
-            # Fallback to conservative approach
-            return False
+        # For AICrawler, most validation happens in discover_links()
+        # This is just a basic sanity check
+        return True
 
     def group_related_pages(
         self,
         urls: List[str],
-        metadata: Optional[Dict[str, List[Dict[str, Any]]]] = None
+        metadata: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+        source: Optional[SourceProfile] = None
     ) -> List[DocumentGroup]:
         """
         Use AI to group related URLs based on semantic similarity.
@@ -154,17 +207,24 @@ class AICrawler(BaseCrawler):
         Args:
             urls: List of URLs to analyze
             metadata: Optional extracted metadata for each URL
+            source: Optional SourceProfile to check ai_enable_grouping setting
 
         Returns:
             List of DocumentGroup objects
         """
+        # Check if grouping is disabled in source settings
+        if source and not source.crawl_settings.ai_enable_grouping:
+            logger.info("AI grouping disabled in crawl_settings")
+            return []
+
         if not self.enable_smart_grouping or len(urls) < 2:
             return []
 
         try:
             groups = self._ai_group_pages(urls, metadata)
             return groups
-        except Exception:
+        except Exception as e:
+            logger.warning(f"AI grouping failed: {e}")
             # Fallback to no grouping
             return []
 
@@ -262,14 +322,16 @@ class AICrawler(BaseCrawler):
 
         return True
 
-    def _ai_filter_links(
+    def _ai_filter_links_batch(
         self,
         link_contexts: List[Dict[str, str]],
         source_url: str,
         source: SourceProfile
     ) -> List[str]:
         """
-        Use AI to filter and select relevant links.
+        Use AI to filter and select relevant links in a single batch call.
+
+        This is the most efficient strategy - one AI call for all links.
 
         Args:
             link_contexts: List of link dictionaries with context
@@ -293,16 +355,57 @@ class AICrawler(BaseCrawler):
         if cache_key in self._response_cache:
             response = self._response_cache[cache_key]
         else:
-            # Call LLM
+            # Call LLM once for all links
+            logger.info(f"AI batch filtering {len(link_contexts)} links in one call")
             response = self.llm_function(prompt)
             self._response_cache[cache_key] = response
-
-        print("LLM RESPONSE:", response)
 
         # Parse response to extract URLs
         relevant_urls = self._parse_link_selection_response(response, link_contexts)
 
-        print("RELEVANT URLS:", relevant_urls)
+        return relevant_urls
+
+    def _ai_filter_links_individual(
+        self,
+        link_contexts: List[Dict[str, str]],
+        source_url: str,
+        source: SourceProfile
+    ) -> List[str]:
+        """
+        Use AI to validate each link individually.
+
+        WARNING: This makes one AI call PER LINK - expensive!
+        Only use with small numbers of links.
+
+        Args:
+            link_contexts: List of link dictionaries with context
+            source_url: Source page URL
+            source: SourceProfile
+
+        Returns:
+            List of relevant URLs
+        """
+        relevant_urls = []
+
+        for i, link_ctx in enumerate(link_contexts, 1):
+            logger.info(f"AI validating link {i}/{len(link_contexts)}: {link_ctx['url']}")
+
+            try:
+                confidence = self._ai_evaluate_link_relevance(
+                    link_ctx['url'],
+                    source_url,
+                    source
+                )
+
+                if confidence >= self.min_confidence:
+                    relevant_urls.append(link_ctx['url'])
+                    logger.info(f"  ✓ Accepted (confidence: {confidence:.2f})")
+                else:
+                    logger.info(f"  ✗ Rejected (confidence: {confidence:.2f})")
+
+            except Exception as e:
+                logger.warning(f"  ✗ Error validating link: {e}")
+                continue
 
         return relevant_urls
 
@@ -338,6 +441,7 @@ Task: Identify which links are most relevant for content extraction. Focus on:
 - Avoid links to media files or downloads
 - Avoid links that suggest pages with categories or tags, not specific readable content
 - Avoid pagination or duplicate content
+- In general, avoid links to external domains unless clearly relevant
 - Prioritize links that seem to contain substantial textual content, useful for RAG systems
 
 Respond with ONLY a JSON array of link indices (0-based) that should be followed.

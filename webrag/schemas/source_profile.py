@@ -49,6 +49,32 @@ class CrawlSettings(BaseModel):
         description="URL patterns to exclude (regex)"
     )
 
+    # AI-specific settings for intelligent crawling
+    ai_validation_strategy: Literal["always", "never", "threshold", "batch"] = Field(
+        default="batch",
+        description=(
+            "When to use AI for individual URL validation:\n"
+            "- 'always': Validate every URL with AI (expensive)\n"
+            "- 'never': Skip per-URL AI validation (only use initial discovery)\n"
+            "- 'threshold': Validate only if discovered URLs <= ai_validation_threshold\n"
+            "- 'batch': Use batch filtering (default, most efficient)"
+        )
+    )
+    ai_validation_threshold: int = Field(
+        default=10,
+        ge=1,
+        description="Max URLs to validate individually when strategy='threshold'"
+    )
+    ai_batch_size: int = Field(
+        default=20,
+        ge=1,
+        description="Number of URLs to validate in a single AI call when strategy='batch'"
+    )
+    ai_enable_grouping: bool = Field(
+        default=True,
+        description="Whether to use AI for intelligent page grouping"
+    )
+
     class Config:
         json_schema_extra = {
             "example": {
