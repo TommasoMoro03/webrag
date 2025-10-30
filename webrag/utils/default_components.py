@@ -6,6 +6,7 @@ from webrag.fetcher.base import BaseFetcher
 from webrag.extractors.base import BaseExtractor
 from webrag.chunking.base import BaseChunker
 from webrag.output.base import BaseExporter
+from webrag.url_relationships.base import BaseURLRelationshipAnalyzer
 
 from typing import Optional
 from webrag.config import AIConfig
@@ -100,7 +101,6 @@ def _get_default_crawler(ai_config: Optional[AIConfig]) -> BaseCrawler:
                 llm_function=llm_function,
                 max_links_per_page=200,
                 min_confidence=0.6,
-                enable_smart_grouping=True,
             )
         except ImportError as e:
             logger.warning(f"AI crawler not available: {e}, falling back to SimpleCrawler")
@@ -120,4 +120,52 @@ def _get_default_crawler(ai_config: Optional[AIConfig]) -> BaseCrawler:
         raise ConfigurationError(
             "No crawler available. Please provide a crawler instance or "
             "implement webrag.crawler.simple_crawler.SimpleCrawler"
+        )
+
+
+def _get_default_url_relationship_analyzer(ai_config: Optional[AIConfig]) -> BaseURLRelationshipAnalyzer:
+    """
+    Get default URL relationship analyzer implementation with smart selection.
+
+    Uses AI analyzer if:
+    1. AI is enabled in config
+    2. AIURLRelationshipAnalyzer implementation is available
+
+    Otherwise falls back to HeuristicURLRelationshipAnalyzer.
+    """
+    # Try AI analyzer first if AI is enabled
+    if ai_config.enabled:
+        try:
+            from webrag.url_relationships.ai_analyzer import AIURLRelationshipAnalyzer
+
+            # Get LLM function from config
+            llm_function = ai_config.get_llm_function()
+
+            logger.info("Using AI-powered URL relationship analyzer")
+            return AIURLRelationshipAnalyzer(
+                llm_function=llm_function,
+                min_group_size=2,
+                enable_grouping=True,
+            )
+        except ImportError as e:
+            logger.warning(f"AI URL relationship analyzer not available: {e}, falling back to HeuristicURLRelationshipAnalyzer")
+        except Exception as e:
+            logger.warning(f"Could not initialize AI URL relationship analyzer: {e}, falling back to HeuristicURLRelationshipAnalyzer")
+
+    # Fallback to HeuristicURLRelationshipAnalyzer
+    try:
+        from webrag.url_relationships.heuristic_analyzer import HeuristicURLRelationshipAnalyzer
+        logger.info("Using heuristic-based URL relationship analyzer")
+        return HeuristicURLRelationshipAnalyzer(
+            min_group_size=2,
+            enable_grouping=True,
+        )
+    except ImportError:
+        logger.warning(
+            "No concrete URL relationship analyzer implementation found. "
+            "Please implement HeuristicURLRelationshipAnalyzer or provide a custom analyzer."
+        )
+        raise ConfigurationError(
+            "No URL relationship analyzer available. Please provide an analyzer instance or "
+            "implement webrag.url_relationships.heuristic_analyzer.HeuristicURLRelationshipAnalyzer"
         )

@@ -23,6 +23,7 @@ from webrag.extractors import BaseExtractor
 from webrag.chunking import BaseChunker
 from webrag.output import BaseExporter
 from webrag.crawler import BaseCrawler
+from webrag.url_relationships import BaseURLRelationshipAnalyzer
 from webrag.config import AIConfig
 from webrag.utils.exceptions import (
     PipelineError,
@@ -37,6 +38,7 @@ from webrag.utils.default_components import (
     _get_default_chunker,
     _get_default_exporter,
     _get_default_crawler,
+    _get_default_url_relationship_analyzer,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,6 +57,7 @@ class WebRAG:
         chunker: Optional[BaseChunker] = None,
         exporter: Optional[BaseExporter] = None,
         crawler: Optional[BaseCrawler] = None,
+        url_relationship_analyzer: Optional[BaseURLRelationshipAnalyzer] = None,
         ai_config: Optional[AIConfig] = None,
         enable_crawling: bool = True,
         fail_fast: bool = False,
@@ -73,6 +76,7 @@ class WebRAG:
             chunker: Custom chunker instance (if None, uses default)
             exporter: Custom exporter instance (if None, uses default)
             crawler: Custom crawler instance (if None, auto-selects based on AI availability)
+            url_relationship_analyzer: Custom URL relationship analyzer (if None, auto-selects based on AI availability)
             ai_config: AI configuration (if None, auto-detects from environment)
             enable_crawling: Enable link discovery and multi-page crawling (default: True)
             fail_fast: If True, stop on first error; if False, collect errors and continue
@@ -114,6 +118,7 @@ class WebRAG:
         self.chunker = chunker or _get_default_chunker()
         self.exporter = exporter or _get_default_exporter()
         self.crawler = crawler or (_get_default_crawler(self.ai_config) if enable_crawling else None)
+        self.url_relationship_analyzer = url_relationship_analyzer or _get_default_url_relationship_analyzer(self.ai_config)
 
         # Pipeline state
         self.result: Optional[PipelineResult] = None
@@ -404,12 +409,12 @@ class WebRAG:
         logger.info(f"  [CRAWL] Crawl complete: Fetched {len(all_fetch_results)} pages across {current_depth + 1} depth level(s)")
         logger.info(f"    Sample URLs: {list(all_fetch_results.keys())[:5]}")
 
-        # Step 4: Group related pages
-        logger.info(f"  [CRAWL 4/6] Grouping related pages...")
+        # Step 4: Analyze URL relationships and group related pages
+        logger.info(f"  [CRAWL 4/6] Analyzing URL relationships...")
         all_urls = list(all_fetch_results.keys())
         logger.info(f"    Analyzing {len(all_urls)} total URLs for relationships...")
 
-        document_groups = self.crawler.group_related_pages(all_urls)
+        document_groups = self.url_relationship_analyzer.analyze_relationships(all_urls)
         self._document_groups.extend(document_groups)
 
         if document_groups:
